@@ -1497,6 +1497,7 @@ static bool ensure_texture(Viewer *viewer, int w, int h) {
 
 static void try_set_window_icon(Viewer *viewer);
 static void free_frame_cache(Viewer *viewer);
+static void apply_aspect_lock(Viewer *viewer);
 
 static bool create_sdl(Viewer *viewer, const char *title) {
     SDL_DisplayID display = SDL_GetPrimaryDisplay();
@@ -1549,14 +1550,7 @@ static bool create_sdl(Viewer *viewer, const char *title) {
         return false;
     }
 
-    if (viewer->aspect_lock && viewer->src.width > 0 && viewer->src.height > 0) {
-        float aspect = (float)viewer->src.width / (float)viewer->src.height;
-        if (!SDL_SetWindowAspectRatio(viewer->window, aspect, aspect)) {
-            fprintf(stderr,
-                    "%s: warning: SDL_SetWindowAspectRatio failed: %s\n",
-                    APP_NAME, SDL_GetError());
-        }
-    }
+    apply_aspect_lock(viewer);
     SDL_SetWindowMinimumSize(viewer->window, 1, 1);
     /* Set the X11/XWayland icon if a hicolor icon is installed. Wayland
        ignores this and uses the .desktop file's Icon= instead. */
@@ -1566,6 +1560,37 @@ static bool create_sdl(Viewer *viewer, const char *title) {
     if (!viewer->renderer) {
         die_sdl("SDL_CreateRenderer");
         return false;
+    }
+
+    /* Pango / cairo text stack: ask the system for its default font map
+       (singleton, no unref), build a font description honoring whatever
+       Sans the user has configured via fontconfig, and create a context
+       used to lay out short strings later.
+
+       NOTE: this must happen unconditionally — including the no-image
+       blank-window case — because draw_text() short-circuits when
+       pango_ctx is NULL. Initializing it only on the eagerly-loaded
+       cmdline path made the info / cheat-sheet overlays render as
+       tofu (empty boxes) after drag-dropping into a blank window. */
+    viewer->pango_fontmap = pango_cairo_font_map_get_default();
+    viewer->pango_ctx = pango_font_map_create_context(viewer->pango_fontmap);
+
+    /* Force grayscale antialiasing for our offscreen text surfaces.
+       If the user's fontconfig enables LCD-subpixel rendering (rgba:
+       rgb / bgr / vrgb / vbgr) — common on Linux desktops — cairo
+       happily honors it when rasterizing to an offscreen ARGB32
+       buffer. The result has colored per-channel coverage at glyph
+       edges that's only correct when blitted 1:1 onto a real LCD
+       window with the matching subpixel order. We upload as a regular
+       RGBA texture and let SDL composite it, so the subpixel coverage
+       shows up as green/magenta fringing. CAIRO_ANTIALIAS_GRAY tells
+       cairo to use plain coverage, which composites cleanly. */
+    if (viewer->pango_ctx) {
+        cairo_font_options_t *fo = cairo_font_options_create();
+        cairo_font_options_set_antialias(fo, CAIRO_ANTIALIAS_GRAY);
+        cairo_font_options_set_subpixel_order(fo, CAIRO_SUBPIXEL_ORDER_DEFAULT);
+        pango_cairo_context_set_font_options(viewer->pango_ctx, fo);
+        cairo_font_options_destroy(fo);
     }
 
     /* For static and GIF: create a texture at natural size and upload the
@@ -1628,13 +1653,6 @@ static bool create_sdl(Viewer *viewer, const char *title) {
         break;
     }
     }
-
-    /* Pango / cairo text stack: ask the system for its default font map
-       (singleton, no unref), build a font description honoring whatever
-       Sans the user has configured via fontconfig, and create a context
-       used to lay out short strings later. */
-    viewer->pango_fontmap = pango_cairo_font_map_get_default();
-    viewer->pango_ctx = pango_font_map_create_context(viewer->pango_fontmap);
 
     rebuild_info_lines(viewer);
     return true;
@@ -1868,12 +1886,7 @@ static bool reopen_image(Viewer *viewer, const char *path) {
     SDL_SetWindowTitle(viewer->window,
                        (viewer->opts && viewer->opts->title)
                          ? viewer->opts->title : path);
-    if (viewer->aspect_lock) {
-        float aspect = (float)viewer->src.width / (float)viewer->src.height;
-        SDL_SetWindowAspectRatio(viewer->window, aspect, aspect);
-    } else {
-        SDL_SetWindowAspectRatio(viewer->window, 0.0f, 0.0f);
-    }
+    apply_aspect_lock(viewer);
 
     /* Per-kind GPU resource setup, mirroring create_sdl(). */
     switch (viewer->src.kind) {
@@ -2837,7 +2850,11 @@ static void toggle_nearest(Viewer *viewer) {
 static void reset_view(Viewer *viewer) {
     /* Per spec: r clears zoom, anchor, flip, and rotate; preserves tile
        mode (but recenters the composition); preserves pause/skim state
-       (animation continues from current frame; do not jump back to 0). */
+       (animation continues from current frame; do not jump back to 0).
+
+       Does NOT resize or reposition the window — the user's chosen
+       window size is sticky. The image is just refit and recentered
+       into whatever space the window currently has. */
     viewer->zoom = 1.0;
     viewer->anchor_x = 0.5;
     viewer->pan_off_x = 0.0;
@@ -2846,25 +2863,37 @@ static void reset_view(Viewer *viewer) {
     viewer->flip_h = false;
     viewer->flip_v = false;
     viewer->rotation_steps = 0;
-    if (!viewer->fullscreen) {
-        SDL_SetWindowSize(viewer->window,
-                          viewer->initial_window_w,
-                          viewer->initial_window_h);
-        SDL_SetWindowPosition(viewer->window,
-                              SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-    }
+    /* Rotation went back to 0; restore the unrotated aspect lock so
+       subsequent user resizes snap to the unrotated aspect. */
+    apply_aspect_lock(viewer);
     rebuild_info_lines(viewer);
+}
+
+/* Push the aspect-ratio constraint to the window based on the current
+   image dimensions AND the current rotation. Quarter-turn rotations
+   (90 / 270) swap the displayed aspect, so the locked aspect needs to
+   swap with them; otherwise the window snaps back to the unrotated
+   aspect and the rotated image is letterboxed inside a wrong-shaped
+   frame. Pass 0/0 to clear the constraint when aspect-lock is off or
+   when no image is loaded. */
+static void apply_aspect_lock(Viewer *viewer) {
+    if (!viewer || !viewer->window) return;
+    if (viewer->aspect_lock
+        && viewer->src.width > 0 && viewer->src.height > 0) {
+        bool quarter = (viewer->rotation_steps == 1
+                        || viewer->rotation_steps == 3);
+        float w = (float)(quarter ? viewer->src.height : viewer->src.width);
+        float h = (float)(quarter ? viewer->src.width  : viewer->src.height);
+        float aspect = w / h;
+        SDL_SetWindowAspectRatio(viewer->window, aspect, aspect);
+    } else {
+        SDL_SetWindowAspectRatio(viewer->window, 0.0f, 0.0f);
+    }
 }
 
 static void toggle_aspect_lock(Viewer *viewer) {
     viewer->aspect_lock = !viewer->aspect_lock;
-    if (viewer->aspect_lock && viewer->src.width > 0 && viewer->src.height > 0) {
-        float aspect = (float)viewer->src.width / (float)viewer->src.height;
-        SDL_SetWindowAspectRatio(viewer->window, aspect, aspect);
-    } else {
-        /* Clear by passing 0/0 (SDL interprets that as "no constraint"). */
-        SDL_SetWindowAspectRatio(viewer->window, 0.0f, 0.0f);
-    }
+    apply_aspect_lock(viewer);
 }
 
 /* Ensure the lazy frame cache is built. Called the first time we pause
@@ -2969,7 +2998,34 @@ static void toggle_tile(Viewer *viewer) {
 }
 
 static void cycle_rotation(Viewer *viewer, int delta) {
+    int old_steps = viewer->rotation_steps;
     viewer->rotation_steps = ((viewer->rotation_steps + delta) % 4 + 4) % 4;
+
+    /* A quarter-turn (odd parity change between old and new) swaps the
+       displayed aspect. Two things have to happen, in this order:
+         1) Swap the window's current width and height. Otherwise the
+            window keeps its old shape and SDL_SetWindowAspectRatio will
+            shrink one axis to fit the new aspect inside the old frame,
+            making the rotated image visibly smaller.
+         2) Push the new aspect-lock so subsequent user resizes snap to
+            the rotated aspect.
+       Half-turns (180°) keep the aspect the same — nothing to do. */
+    bool old_quarter = (old_steps == 1 || old_steps == 3);
+    bool new_quarter = (viewer->rotation_steps == 1
+                        || viewer->rotation_steps == 3);
+    if (old_quarter != new_quarter
+        && viewer->window && !viewer->fullscreen) {
+        int win_w = 0, win_h = 0;
+        SDL_GetWindowSize(viewer->window, &win_w, &win_h);
+        if (win_w > 0 && win_h > 0) {
+            /* Clear the aspect-ratio constraint first; SDL/Wayland will
+               otherwise clamp the SetWindowSize call to the still-old
+               aspect, leaving us with a wrong-shaped window. */
+            SDL_SetWindowAspectRatio(viewer->window, 0.0f, 0.0f);
+            SDL_SetWindowSize(viewer->window, win_h, win_w);
+        }
+    }
+    apply_aspect_lock(viewer);
 }
 
 /* Pan by a mouse delta. dx/dy are in window-unit screen coordinates
