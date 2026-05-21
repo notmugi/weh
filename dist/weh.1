@@ -6,7 +6,7 @@ weh \- tiny C image viewer for X11 and Wayland
 .SH SYNOPSIS
 .B weh
 [\fIOPTIONS\fR]
-[\fIIMAGE\fR|\fIDIRECTORY\fR]
+[\fIIMAGE\fR...|\fIDIRECTORY\fR]
 .SH DESCRIPTION
 .B weh
 is a minimal image viewer whose only job is to display an image. It runs
@@ -22,23 +22,34 @@ animated AVIF if the loader is installed, MNG).
 SVG, rasterized on demand at the exact target pixel size so it stays
 crisp at any zoom level.
 .PP
-The argument is optional. If no
-.I IMAGE
-is given,
+Arguments are optional. With no argument,
 .B weh
-opens a blank window; drag-drop an image or a directory onto it to start
-viewing. If a
+opens a blank window; drag-drop an image, multiple images, or a
+directory onto it to start viewing.
+
+If a
 .I DIRECTORY
 is given, all openable images in it are listed (sorted case-insensitively
-by basename); the arrow keys navigate the list with wrap-around. If a
-single
+by basename) and
+.BR , " / " .
+navigate the list with wrap-around.
+
+If multiple
 .I IMAGE
-is given, no directory listing is built and the arrow keys do nothing.
+arguments are given (or a multi-file drag-drop occurs), the given files
+form an ad-hoc playlist in the order they were supplied; navigation
+keys move through that list. No directory scan is performed — only the
+files explicitly listed appear in the playlist.
+
+If a single
+.I IMAGE
+is given, no playlist is built and the navigation keys are no-ops until
+a directory or multi-file drop arrives.
 .PP
 The image is fitted inside the window with the original aspect ratio
 preserved. When the window's aspect does not match the image's, the
 non-image area is filled with a configurable background color (default
-black). On compositors that honor it, the window itself is locked to the
+white). On compositors that honor it, the window itself is locked to the
 image's aspect ratio.
 .SH OPTIONS
 .TP
@@ -89,8 +100,8 @@ file to look up the application icon. Default
 .TP
 .BI \-\-bg = #RRGGBB
 Background and letterbox color, in hex. Default
-.B #000000
-(black).
+.B #ffffff
+(white).
 .SH CONTROLS
 .TP
 .B f

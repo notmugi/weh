@@ -13,7 +13,8 @@ fullscreen, animate, skim, and drag-drop files onto.
   animated WebP / animated AVIF** via gdk-pixbuf; **SVG** via librsvg,
   re-rasterized on demand for crispness at any zoom.
 - **Aspect-locked window** that snaps back to the image's aspect during
-  interactive resize, with a black-bar fallback for tiled wms. Toggle with `a`
+  interactive resize, with a configurable letterbox fallback for tiled
+  wms (white by default; override with `--bg`). Toggle with `a`.
 - **Smooth pan and zoom** — wheel zoom anchors on whatever you pan to;
   clicking and dragging pans the image.
 - **Flip and rotate** with `h` (horizontal), `v` (vertical), `k` (rotate CCW), `l` (rotate CW).
@@ -21,8 +22,9 @@ fullscreen, animate, skim, and drag-drop files onto.
   mirrored tiling so seams match. Great for viewing tiled game textures. Toggle with `t`
 - **Pixel-art mode** — nearest-neighbor texture sampling toggle. Toggle with `n`
 - **Animation control** — pause/resume, frame-by-frame skim. Pause with `p` and skim with `-/=`
-- **Directory navigation** — launch with a directory as input or drag it onto the window. navigate with `,` to move backward and `.` to move forward
-- **Drag-and-drop** an image or a directory onto the window to display the image or directory.
+- **Directory navigation** — launch with a directory as input or drag it onto the window. Navigate with `,` to move backward and `.` to move forward.
+- **Multi-file playlist** — launch with multiple image arguments (or drag-drop several images at once) to navigate through just those files, no directory scan involved.
+- **Drag-and-drop** an image, a set of images, or a directory onto the window to start viewing.
 - **Info overlay:** toggle with `i` to see path, size, dimensions,
   format, animation status, current frame, and zoom level.
 - **Binds overlay:** Display all keybinds with the `b` key
@@ -75,7 +77,7 @@ sudo make uninstall
 ## Usage
 
 ```sh
-weh [OPTIONS] [IMAGE|DIRECTORY]
+weh [OPTIONS] [IMAGE...|DIRECTORY]
 ```
 
 Open a single image:
@@ -89,7 +91,16 @@ Open a directory and navigate through it:
 ```sh
 weh ~/Pictures/
 ```
-`,` moves backwards, `.` moves forward.
+
+Open several specific images as an ad-hoc playlist:
+
+```sh
+weh a.png b.jpg c.webp
+```
+
+In all three forms above, `,` moves backwards through the list and `.`
+moves forward (with wrap-around). `Home` / `End` jump to the first /
+last entry.
 
 Launch blank — drop something onto the window to begin:
 
@@ -137,8 +148,8 @@ See `weh --help` and `man weh` for the full reference.
 | `p`               | Pause/resume animation (animated images only)                |
 | `-`               | Previous animation frame (skim; implicitly pauses)           |
 | `=`               | Next animation frame                                         |
-| `,` / `.`         | Previous / next image in directory (wraps)                   |
-| `Home` / `End`    | First / last image in directory                              |
+| `,` / `.`         | Previous / next image in playlist (wraps)                    |
+| `Home` / `End`    | First / last image in playlist                               |
 | `q` or `Esc`      | Quit                                                         |
 | Mouse wheel       | Zoom in/out (anchors on the panned-to point)                 |
 | Left-drag         | Pan (1:1 with cursor)                                        |
@@ -158,7 +169,7 @@ See `weh --help` and `man weh` for the full reference.
 | `-z`, `--zoom=N`      | Initial zoom factor (default `1.0`)               |
 | `-t`, `--title=STR`   | Window title (default: filename)                  |
 | `--app-id=STR`        | Wayland `app_id` / X11 `WM_CLASS` (default below) |
-| `--bg=#RRGGBB`        | Background / letterbox color (default `#000000`)  |
+| `--bg=#RRGGBB`        | Background / letterbox color (default `#ffffff`)  |
 
 The default `app_id` is `io.github.notmugi.weh`. This is the string a
 compositor matches against `weh.desktop` to pick up the icon, so don't

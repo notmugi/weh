@@ -156,9 +156,16 @@ typedef struct Source {
 } Source;
 
 /* User-tunable options (CLI flags, env, defaults).
-   All fields have sensible defaults; only `image_path` is required. */
+   All fields have sensible defaults; image paths are optional.
+
+   image_paths is a non-owning array of pointers into argv. count == 0
+   means no images given (blank window). count == 1 may be a single
+   file OR a directory (dir is auto-expanded into a DirList). count > 1
+   means an ad-hoc playlist — each path is treated as a single file and
+   the union becomes the navigation list. */
 typedef struct Options {
-    const char *image_path;     /* positional argument; NULL → start blank */
+    const char **image_paths;   /* non-owning; points into argv */
+    int          image_count;
     const char *title;          /* window title (defaults to APP_TITLE or filename) */
     const char *app_id;         /* xdg app_id / X11 WM_CLASS (defaults to APP_ID) */
     bool start_fullscreen;      /* --fullscreen */
@@ -270,12 +277,14 @@ static void print_version(FILE *stream) {
 
 static void print_usage(FILE *stream) {
     fprintf(stream,
-        "Usage: %s [OPTIONS] [IMAGE|DIRECTORY]\n"
+        "Usage: %s [OPTIONS] [IMAGE...|DIRECTORY]\n"
         "\n"
         "A tiny image viewer for X11 and Wayland.\n"
         "\n"
-        "If IMAGE is omitted, weh opens a blank window; drag-drop an image\n"
-        "or a directory onto it to start viewing.\n"
+        "With no arguments, weh opens a blank window; drag-drop an image,\n"
+        "multiple images, or a directory onto it to start viewing.\n"
+        "With multiple IMAGE arguments (or a multi-file drag-drop) the\n"
+        "images form an ad-hoc playlist navigable with ',' and '.'.\n"
         "\n"
         "Options:\n"
         "  -h, --help              Show this help and exit\n"
@@ -288,7 +297,7 @@ static void print_usage(FILE *stream) {
         "  -z, --zoom=N            Initial zoom factor (default 1.0)\n"
         "  -t, --title=STR         Window title (default: filename)\n"
         "      --app-id=STR        Set Wayland app_id / X11 WM_CLASS (default %s)\n"
-        "      --bg=#RRGGBB        Background / letterbox color (default 000000)\n"
+        "      --bg=#RRGGBB        Background / letterbox color (default ffffff)\n"
         "\n"
         "Controls (in-window):\n"
         "  f                  Toggle fullscreen\n"
@@ -304,8 +313,8 @@ static void print_usage(FILE *stream) {
         "  1..9               Tile radius: 1 = 3x3 ... 9 = 19x19 (when tiling)\n"
         "  p                  Pause / resume animation (animated images only)\n"
         "  -  /  =            Step to previous / next frame (animated images only)\n"
-        "  , / .              Previous / next image in directory (with wrap)\n"
-        "  Home / End         First / last image in directory\n"
+        "  , / .              Previous / next image in playlist (with wrap)\n"
+        "  Home / End         First / last image in playlist\n"
         "  q, Esc             Quit\n"
         "  Mouse wheel        Zoom in/out (anchors on the panned-to point)\n"
         "  Left-drag          Pan\n"
@@ -336,7 +345,7 @@ static int parse_options(int argc, char **argv, Options *opts) {
     opts->title  = NULL;
     opts->app_id = APP_ID;
     opts->initial_zoom = 1.0;
-    opts->bg_r = opts->bg_g = opts->bg_b = 0;
+    opts->bg_r = opts->bg_g = opts->bg_b = 255;
 
     int i = 1;
     for (; i < argc; i++) {
@@ -430,14 +439,21 @@ static int parse_options(int argc, char **argv, Options *opts) {
     next_opt:;
     }
 
-    /* IMAGE is optional. With no argument, we launch a blank window
-       and wait for a drag-drop. */
-    if (i < argc) {
-        opts->image_path = argv[i++];
-    }
-    if (i < argc) {
-        fprintf(stderr, "%s: extra arguments after IMAGE\n", APP_NAME);
-        return 2;
+    /* Positional args are images. Zero is fine (blank window). One is
+       fine (single file or directory). More than one creates an ad-hoc
+       playlist — see DirList usage in main(). Allocated lazily so the
+       common no-image case stays alloc-free. */
+    int remaining = argc - i;
+    if (remaining > 0) {
+        opts->image_paths = malloc(sizeof(char *) * (size_t)remaining);
+        if (!opts->image_paths) {
+            fprintf(stderr, "%s: out of memory parsing arguments\n", APP_NAME);
+            return 2;
+        }
+        for (int k = 0; i < argc; i++, k++) {
+            opts->image_paths[k] = argv[i];
+        }
+        opts->image_count = remaining;
     }
     /* Sanitize initial_zoom. */
     if (!isfinite(opts->initial_zoom) || opts->initial_zoom <= 0.0) {
@@ -1294,6 +1310,36 @@ static bool dirlist_load(DirList *dl, const char *dir_path) {
 
     dl->base_dir = strdup(dir_path);
     dl->current = 0;
+    return true;
+}
+
+/* Populate `dl` with the given list of file paths verbatim. Used to
+   build an ad-hoc playlist from multiple CLI args or from a multi-file
+   drag-drop. Unlike dirlist_load() this does NOT scan a directory, does
+   NOT sort (caller-supplied order is preserved — usually the order the
+   user typed or dropped them), and does NOT filter by extension (the
+   user explicitly asked for these files, so trust them).
+
+   Paths are duplicated into the DirList so the caller can free its
+   own storage immediately. Returns true on success; on OOM, partial
+   state is freed and dl is left empty. */
+static bool dirlist_from_paths(DirList *dl, const char *const *paths, int count) {
+    dirlist_free(dl);
+    if (count <= 0) return true;
+    dl->entries = malloc(sizeof(char *) * (size_t)count);
+    if (!dl->entries) return false;
+    for (int i = 0; i < count; i++) {
+        dl->entries[i] = strdup(paths[i]);
+        if (!dl->entries[i]) {
+            for (int k = 0; k < i; k++) free(dl->entries[k]);
+            free(dl->entries);
+            dl->entries = NULL;
+            return false;
+        }
+        dl->count++;
+    }
+    dl->current = 0;
+    dl->base_dir = NULL; /* not anchored to a single directory */
     return true;
 }
 
@@ -2525,8 +2571,8 @@ static const BindEntry BINDS[] = {
     {"1-9",       "Tile radius (in tile mode)"},
     {"p",         "Pause / resume animation"},
     {"- / =",     "Previous / next animation frame"},
-    {", / .",     "Previous / next image in directory"},
-    {"Home / End", "First / last image in directory"},
+    {", / .",     "Previous / next image in playlist"},
+    {"Home / End", "First / last image in playlist"},
     {"Wheel",     "Zoom in/out"},
     {"Drag",      "Pan"},
     {"q / Esc",   "Quit"},
@@ -3261,6 +3307,20 @@ static Sint32 time_until_next_wake_ms(const Viewer *viewer) {
 
 static void event_loop(Viewer *viewer) {
     bool running = true;
+
+    /* Drag-drop batching state. SDL3 fires multi-file drops as a
+       BEGIN, one DROP_FILE per item, then COMPLETE. While a batch is
+       open we accumulate paths here instead of opening each one as it
+       arrives; on COMPLETE we either open the single file (preserving
+       directory auto-detect via open_path) or build a playlist from
+       the whole batch. The batch is also "implicit" — if a DROP_FILE
+       arrives without a BEGIN (some compositors send it that way for
+       single drops) we open it inline. */
+    bool   drop_batch_open    = false;
+    char **drop_batch_paths   = NULL;
+    int    drop_batch_count   = 0;
+    int    drop_batch_cap     = 0;
+
     render(viewer);
 
     while (running) {
@@ -3468,19 +3528,90 @@ static void event_loop(Viewer *viewer) {
                     }
                     break;
 
+                case SDL_EVENT_DROP_BEGIN:
+                    /* Start collecting paths until DROP_COMPLETE. */
+                    drop_batch_open  = true;
+                    drop_batch_count = 0;
+                    break;
+
                 case SDL_EVENT_DROP_FILE:
                     if (event.drop.data) {
-                        /* event.drop.data is owned by SDL and only valid
-                           during the event. open_path() handles both
-                           single files (opens directly) and directories
-                           (populates the nav list and opens the first). */
-                        if (open_path(viewer, event.drop.data)) {
-                            redraw = true;
+                        if (drop_batch_open) {
+                            /* Append to the batch. event.drop.data is
+                               owned by SDL and only valid for this
+                               event, so dup it. */
+                            if (drop_batch_count == drop_batch_cap) {
+                                int new_cap = drop_batch_cap ? drop_batch_cap * 2 : 8;
+                                char **g = realloc(drop_batch_paths,
+                                                   sizeof(char *) * (size_t)new_cap);
+                                if (g) {
+                                    drop_batch_paths = g;
+                                    drop_batch_cap = new_cap;
+                                }
+                            }
+                            if (drop_batch_count < drop_batch_cap) {
+                                char *dup = strdup(event.drop.data);
+                                if (dup) drop_batch_paths[drop_batch_count++] = dup;
+                            }
                         } else {
-                            fprintf(stderr,
-                                    "%s: failed to open dropped path '%s'\n",
-                                    APP_NAME, event.drop.data);
+                            /* No BEGIN bracketing — open immediately.
+                               open_path() handles single files and
+                               directories. */
+                            if (open_path(viewer, event.drop.data)) {
+                                redraw = true;
+                            } else {
+                                fprintf(stderr,
+                                        "%s: failed to open dropped path '%s'\n",
+                                        APP_NAME, event.drop.data);
+                            }
                         }
+                    }
+                    break;
+
+                case SDL_EVENT_DROP_COMPLETE:
+                    if (drop_batch_open) {
+                        if (drop_batch_count == 1) {
+                            /* Single file/dir dropped: same as old behavior. */
+                            if (open_path(viewer, drop_batch_paths[0])) {
+                                redraw = true;
+                            } else {
+                                fprintf(stderr,
+                                        "%s: failed to open dropped path '%s'\n",
+                                        APP_NAME, drop_batch_paths[0]);
+                            }
+                        } else if (drop_batch_count > 1) {
+                            /* Multiple files: build an ad-hoc playlist
+                               and open the first. If any entry is a
+                               directory it's silently treated as a
+                               file path here (open_path would expand
+                               a dir, but a playlist of mixed dirs+files
+                               doesn't make sense — the user can drop a
+                               single dir if they want that). */
+                            if (reopen_image(viewer, drop_batch_paths[0])) {
+                                DirList dl;
+                                memset(&dl, 0, sizeof(dl));
+                                if (dirlist_from_paths(&dl,
+                                        (const char *const *)drop_batch_paths,
+                                        drop_batch_count)) {
+                                    dirlist_free(&viewer->dir);
+                                    viewer->dir = dl;
+                                    viewer->dir.current = 0;
+                                    rebuild_info_lines(viewer);
+                                }
+                                redraw = true;
+                            } else {
+                                fprintf(stderr,
+                                        "%s: failed to open first of %d "
+                                        "dropped paths\n",
+                                        APP_NAME, drop_batch_count);
+                            }
+                        }
+                        /* Tear down the batch regardless. */
+                        for (int k = 0; k < drop_batch_count; k++) {
+                            free(drop_batch_paths[k]);
+                        }
+                        drop_batch_count = 0;
+                        drop_batch_open  = false;
                     }
                     break;
 
@@ -3492,6 +3623,11 @@ static void event_loop(Viewer *viewer) {
 
         if (redraw && running) render(viewer);
     }
+
+    /* If we exit mid-batch (rare; e.g. user closes the window during
+       a drag), free anything we accumulated. */
+    for (int k = 0; k < drop_batch_count; k++) free(drop_batch_paths[k]);
+    free(drop_batch_paths);
 }
 
 /* ---------- main ---------- */
@@ -3524,16 +3660,30 @@ int main(int argc, char **argv) {
 
     gegl_init(&argc, &argv);
 
-    /* If a path was given on the command line, load it eagerly (so we
-       size the initial window to the image). For a directory, we'll
-       defer to open_path() after the window exists, since that path
-       populates the nav list and only opens the first image. */
-    bool is_dir_arg = false;
-    if (opts.image_path) {
-        if (is_directory(opts.image_path)) {
+    /* If at least one path was given on the command line, load the
+       first one eagerly so we can size the initial window to it. For
+       a directory, defer to open_path() after the window exists (it
+       populates the nav list and opens the first image). For multiple
+       files, we eagerly load the first and build the playlist after
+       the window exists. */
+    const char *first_path = (opts.image_count > 0) ? opts.image_paths[0] : NULL;
+    bool is_dir_arg     = false;
+    bool is_multi_arg   = (opts.image_count > 1);
+    if (first_path) {
+        if (is_directory(first_path)) {
             is_dir_arg = true;
+            /* Multi-arg with the first being a directory: not supported
+               cleanly (mixing a dir-listing with explicit files would
+               be confusing). Treat it as the dir case and warn. */
+            if (is_multi_arg) {
+                fprintf(stderr,
+                        "%s: first path is a directory; ignoring the "
+                        "remaining %d argument(s)\n",
+                        APP_NAME, opts.image_count - 1);
+                is_multi_arg = false;
+            }
             /* Don't load via load_source yet; need the window & dirlist. */
-        } else if (!load_source(opts.image_path, &viewer.src)) {
+        } else if (!load_source(first_path, &viewer.src)) {
             gegl_exit();
             return 1;
         }
@@ -3548,7 +3698,7 @@ int main(int argc, char **argv) {
 
     const char *window_title = opts.title
         ? opts.title
-        : (opts.image_path ? opts.image_path : APP_TITLE);
+        : (first_path ? first_path : APP_TITLE);
     if (!create_sdl(&viewer, window_title)) {
         destroy_viewer(&viewer);
         SDL_Quit();
@@ -3559,22 +3709,41 @@ int main(int argc, char **argv) {
     /* Populate current_path / current_size_bytes for the eagerly-loaded
        file case (the directory case goes through open_path below, which
        sets these via reopen_image). */
-    if (opts.image_path && !is_dir_arg && viewer.src.width > 0) {
-        viewer.current_path = strdup(opts.image_path);
+    if (first_path && !is_dir_arg && viewer.src.width > 0) {
+        viewer.current_path = strdup(first_path);
         struct stat st;
         viewer.current_size_bytes =
-            (stat(opts.image_path, &st) == 0) ? (size_t)st.st_size : 0;
+            (stat(first_path, &st) == 0) ? (size_t)st.st_size : 0;
         rebuild_info_lines(&viewer);
     }
 
     /* If launched with a directory, do that now (window exists, so any
        failures can be reported but the window stays up). */
     if (is_dir_arg) {
-        if (!open_path(&viewer, opts.image_path)) {
+        if (!open_path(&viewer, first_path)) {
             fprintf(stderr,
                     "%s: directory '%s' had no openable images; "
                     "starting blank — drop a file to begin\n",
-                    APP_NAME, opts.image_path);
+                    APP_NAME, first_path);
+        }
+    }
+
+    /* Multi-file ad-hoc playlist: the first image is already loaded
+       (eager load above), so just build the DirList from all the CLI
+       paths and point current at index 0. */
+    if (is_multi_arg) {
+        DirList dl;
+        memset(&dl, 0, sizeof(dl));
+        if (dirlist_from_paths(&dl, opts.image_paths, opts.image_count)) {
+            dirlist_free(&viewer.dir);
+            viewer.dir = dl;
+            viewer.dir.current = 0;
+            rebuild_info_lines(&viewer);
+        } else {
+            fprintf(stderr,
+                    "%s: out of memory building image playlist; nav "
+                    "keys (, .) will be disabled\n",
+                    APP_NAME);
         }
     }
 
@@ -3583,5 +3752,6 @@ int main(int argc, char **argv) {
     destroy_viewer(&viewer);
     SDL_Quit();
     gegl_exit();
+    free(opts.image_paths); /* shallow: argv strings are not owned */
     return 0;
 }
