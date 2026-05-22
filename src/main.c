@@ -1443,6 +1443,8 @@ static bool dirlist_from_paths(DirList *dl, const char *const *paths, int count)
             for (int k = 0; k < i; k++) free(dl->entries[k]);
             free(dl->entries);
             dl->entries = NULL;
+            dl->count = 0; /* reset so a later dirlist_free won't
+                              iterate over the freed array */
             return false;
         }
         dl->count++;
