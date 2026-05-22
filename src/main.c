@@ -2468,6 +2468,60 @@ static const int BINDS_COUNT = (int)(sizeof(BINDS) / sizeof(BINDS[0]));
 
 /* ---------- SVG tile-pyramid management (main-thread) ---------- */
 
+/* True when the SVG sharp tile is current-generation and fully covers
+   the on-screen visible image rect. When this holds, the low-res base
+   can be suppressed so its edges don't bleed through at high zoom.
+   Always false in tile-mode (overlay is disabled there). */
+static bool svg_sharp_covers_view(const Viewer *viewer,
+                                  int window_w, int window_h,
+                                  double draw_w, double draw_h) {
+    if (viewer->src.kind != IMG_SVG) return false;
+    const SvgImage *svg = &viewer->src.v.svg;
+    if (!svg->tile_valid || !svg->tile_tex) return false;
+    if (svg->tile_generation != svg->current_generation) return false;
+    if (svg->natural_w_f <= 0.0 || svg->natural_h_f <= 0.0) return false;
+    if (viewer->tile_on && viewer->tile_radius > 0) return false;
+
+    bool transformed = (viewer->rotation_steps != 0
+                        || viewer->flip_h || viewer->flip_v);
+    if (transformed) {
+        const double eps = 1e-3;
+        return svg->tile_ix <= eps
+            && svg->tile_iy <= eps
+            && svg->tile_ix + svg->tile_iw >= svg->natural_w_f - eps
+            && svg->tile_iy + svg->tile_ih >= svg->natural_h_f - eps;
+    }
+
+    /* Visible image rect in image-space (matches svg_update_pyramid). */
+    double w2p_sx, w2p_sy;
+    window_to_pixel_scale(viewer, &w2p_sx, &w2p_sy);
+    double img_x = (double)window_w * 0.5
+                 - viewer->anchor_x * draw_w
+                 + viewer->pan_off_x * w2p_sx;
+    double img_y = (double)window_h * 0.5
+                 - viewer->anchor_y * draw_h
+                 + viewer->pan_off_y * w2p_sy;
+
+    double vis_x0 = img_x > 0.0 ? 0.0 : -img_x;
+    double vis_y0 = img_y > 0.0 ? 0.0 : -img_y;
+    double vis_x1 = (double)window_w - img_x;
+    double vis_y1 = (double)window_h - img_y;
+    if (vis_x1 > draw_w) vis_x1 = draw_w;
+    if (vis_y1 > draw_h) vis_y1 = draw_h;
+    if (vis_x1 <= vis_x0 || vis_y1 <= vis_y0) return true;
+
+    double sx = svg->natural_w_f / draw_w;
+    double sy = svg->natural_h_f / draw_h;
+    double ix0 = vis_x0 * sx, iy0 = vis_y0 * sy;
+    double ix1 = vis_x1 * sx, iy1 = vis_y1 * sy;
+
+    const double eps = 1.0;
+    return svg->tile_ix <= ix0 + eps
+        && svg->tile_iy <= iy0 + eps
+        && svg->tile_ix + svg->tile_iw >= ix1 - eps
+        && svg->tile_iy + svg->tile_ih >= iy1 - eps;
+}
+
 /* Returns true if the current view state differs from what was
    recorded last frame. Also refreshes the recorded values. */
 static bool svg_view_changed(SvgImage *svg, int window_w, int window_h,
@@ -2934,9 +2988,16 @@ static void render(Viewer *viewer) {
 
         /* SVG: maintain the sharp-tile pyramid. May queue a worker
            request and/or upload a freshly-rendered tile. The base
-           texture (viewer->texture) is drawn regardless; the tile
-           is overlaid afterwards when valid. */
+           texture (viewer->texture) is normally drawn first as a
+           guaranteed-non-black backdrop; the tile is overlaid
+           afterwards when valid. We skip the base draw entirely once
+           the sharp tile has caught up to the current view so its
+           lower-resolution edges don't bleed at high zoom. */
         svg_update_pyramid(viewer, window_w, window_h, draw_w, draw_h);
+        bool hide_base = (viewer->src.kind == IMG_SVG)
+                         && svg_sharp_covers_view(viewer,
+                                                  window_w, window_h,
+                                                  draw_w, draw_h);
 
         double center_x = (double)window_w * 0.5;
         double center_y = (double)window_h * 0.5;
@@ -3009,14 +3070,16 @@ static void render(Viewer *viewer) {
                 dst.x = (float)(tile_cx - (double)dst.w * 0.5);
                 dst.y = (float)(tile_cy - (double)dst.h * 0.5);
 
-                if (angle != 0.0 || flip != SDL_FLIP_NONE) {
-                    SDL_RenderTextureRotated(viewer->renderer,
-                                             viewer->texture,
-                                             NULL, &dst,
-                                             angle, NULL, flip);
-                } else {
-                    SDL_RenderTexture(viewer->renderer,
-                                      viewer->texture, NULL, &dst);
+                if (!hide_base) {
+                    if (angle != 0.0 || flip != SDL_FLIP_NONE) {
+                        SDL_RenderTextureRotated(viewer->renderer,
+                                                 viewer->texture,
+                                                 NULL, &dst,
+                                                 angle, NULL, flip);
+                    } else {
+                        SDL_RenderTexture(viewer->renderer,
+                                          viewer->texture, NULL, &dst);
+                    }
                 }
                 /* For non-tile-mode SVG, overlay the sharp tile (if any)
                    sharing the parent's transform pipeline. The overlay
